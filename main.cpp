@@ -14,20 +14,20 @@
 using namespace std;
 
 const char PLATFORM_CHAR = '#';
-
 const char SNAKE_CHAR = 'S';
 
 const int ESCAPE_ROUTES = 1;
 
-const int MAX_DFS_DEPTH = 10; // DFS pathfinding depth limit
-const int ENEMY_DISTANCE = 8;
-const int INITIAL_ZONES_SPLITTING = 2;
-const int FULL_SIM_DEPTH = 3;
+const int MAX_DFS_DEPTH = 9; // DFS pathfinding depth limit
+const int DEPTH_INCREASING = 0;
+const int SNAKE_EFFECTIVE_LENGTH = 15;
+
+int MAX_CLUSTER_COUNT = 10;
+const int CLUSTER_DISTANCE = 5; // max distance between batteries in a cluster
+const int MAX_CLUSTER_SIZE = 6; // max batteries per cluster
+const int MAX_AVAILABLE_DISTANCE = 8; // max distance for intermediate DFS targets
 
 const int BASE_BONUS = 2350; // 2000 - ok, 2500 - max, 2400 - optimal
-const int PREVENTING_ENEMY_BONUS = 3000; // intercept battery from enemy, must outweigh exploration
-const int LOOP_ON_PLACE_PENALTY = -3000;
-const int ADDITIONAL_BONUS = 1000; // eat battery right now
 const int FALL_PENALTY = 1400;    // penalty for any move that causes falling
 const int SUPPORT_BONUS = 2500;  // bonus/penalty for support stability (long snakes only)
 const int SUPPORT_TURNS_THRESHOLD = 2; // start caring about support when <= this many turns left
@@ -35,26 +35,12 @@ const int DEATH_FINE = -99999;
 const int ENEMY_HEAD_FINE = -51000;
 const int TRAPPED_FINE = -90000;
 
-const double FALL_COST_FACTOR = 0.5;  // each row of falling adds 0.5 to BFS distance
-const int DECAY_PER_STEP = (BASE_BONUS + 700) / MAX_DFS_DEPTH;  // smooth decay over full search radius
-const int KEEP_DIRECTION_BONUS = 35;
 const int OUT_OF_BOUNDS_PENALTY = -1000;
-const int LOOP_PENALTY = -900; // -900, very strictly -> why should do something more than once?
-const int MAX_LOOP_PENALTY = -7500; // cap: worse than loop, but better than death (-9000/-9999)
-const int EXPLORING_BONUS = 1200; // soft guidance, doesn't outweigh battery
-const int EXPLORING_CORRECT_BONUS = 200; //
-const int COM_BONUS = 15;            // center of mass bonus/penalty
-const int NEAREST_CLUSTER_BONUS = 10; // nearest cluster bonus/penalty
-const int BODY_BLOCK_BONUS = 500;
 
 const int MAX_FLOOD_FILL = 32;
+const int MAX_TUNNEL_DEPTH = 6;
 const int MAX_AER = 6;
 const int AER_ENEMY_DISTANCE = 3;
-const int CHOSEN_LOCK_TURNS = 10; // how long a snake stays "chosen"
-const int CHOSEN_START_TURN = 7; // don't activate before this turn
-const int CLUSTER_DISTANCE = 5; // max distance between batteries in a cluster
-const int CHOSEN_BONUS = 2500; // bonus for chosen snake moving toward target cluster
-const int MAX_CHOSEN_SLOTS = 4; // max number of snakes with cluster assignments
 const int ROUTE_FINDING_BONUS = 100; // escaping from traps, additionalRoutes * ROUTE_FINDING_BONUS, 50 - ok
 
 
@@ -203,6 +189,17 @@ struct LevelMap {
         return false;
     }
 
+    int getPlatformTop(int x) const {
+        if (x < 0 || x >= width) return -1;
+        int platformY = -1;
+        for (int y = height - 1; y >= 0; y--) {
+            if (levelMap[y][x] == PLATFORM_CHAR) { platformY = y; break; }
+        }
+        if (platformY < 0) return -1;
+        while (platformY > 0 && levelMap[platformY - 1][x] == PLATFORM_CHAR) platformY--;
+        return platformY;
+    }
+
     void debug() const {
         for (const auto level : levelMap) {
             cerr << level << endl;
@@ -278,10 +275,14 @@ struct Snake {
     }
 
     int getId() const { return id; }
+    void setBlocker(bool v) { isBlocker = v; }
+    bool getBlocker() const { return isBlocker; }
 
     void debug() const {
         cerr << "S" << id << " H=" << getHead() << " " << getDirectionName(getMovingDirection())
-             << " " << getBody() << endl;
+             << " " << getBody();
+        if (isBlocker) cerr << " [BLK]";
+        cerr << endl;
     }
 
     void updateHead(const Point& p, bool isGrow) {
@@ -304,6 +305,7 @@ struct Snake {
 
     int id;
     bool isMy;
+    bool isBlocker = false;
     vector<Point> body;
     Direction movingDirection;
     bool isDead;
@@ -335,7 +337,7 @@ CellType whatInPoint(const Point& p, const LevelMap& levelMap,
     // 3. Snakes
     for (const auto& [id, snake] : allSnakes) {
         if (!snake.isAlive()) continue;
-        
+
         for (const Point& part : snake.getBody()) {
             if (part == p) {
                 if (snake.isMySnake()) return MY_SNAKE;
@@ -356,14 +358,14 @@ bool isSolidCollision(const Point& p, const LevelMap& levelMap,
         if (!snake.isAlive()) continue;
         int idx = snake.isPartOfSnake(p);
         if (idx < 0) continue;
-        // Own tail segments that will move away (unless eating battery)
+        // Tail segments will move away (own snake: unless eating battery; any snake: last segment)
         if (id == myId && !eatingBattery && idx >= (int)snake.getBody().size() - skipTailCount) continue;
+        if (id != myId && idx == (int)snake.getBody().size() - 1) continue;
         return true;
     }
     return false;
 }
 
-const int MAX_TUNNEL_DEPTH = 6;
 
 // Follow tunnel from entry point, return AER at exit. 0 = dead end.
 int followTunnel(const Point& entry, const Point& prev, const LevelMap& levelMap,
@@ -384,19 +386,19 @@ int followTunnel(const Point& entry, const Point& prev, const LevelMap& levelMap
         if (exits == 0) return 0; // dead end
         if (exits > 1) {
             // Tunnel exit — count AER here
-            int aer = 0;
+            int additionalEscapeRoutes = 0;
             for (int dir = 0; dir < 4; dir++) {
                 Point next = getCustomPoint(current, dir);
                 if (!isSolidCollision(next, levelMap, allSnakes, myId, eatingBattery)) {
                     for (int d1 = 0; d1 < 4; ++d1) {
                         Point t = getCustomPoint(next, d1);
                         if (!isSolidCollision(t, levelMap, allSnakes, myId, eatingBattery)) {
-                            ++aer;
+                            ++additionalEscapeRoutes;
                         }
                     }
                 }
             }
-            return min(aer, MAX_AER);
+            return min(additionalEscapeRoutes, MAX_AER);
         }
         // exits == 1: continue through tunnel
         prevP = current;
@@ -420,18 +422,22 @@ pair<int, int> countEscapeRoutes(const Point& from, const LevelMap& levelMap,
     return {escapeRoutes, additionalEscapeRoutes};
 }
 
-pair<int, int> findClosestEnemy(const Point& target, const map<int, Snake>& allSnakes) {
-    int minDist = 9999;
-    int enemyId = -1;
+// Returns {distance, id, head} of closest enemy to target
+struct EnemyInfo { int dist = 9999; int id = -1; Point head = Point(-1,-1); };
+EnemyInfo findClosestEnemy(const Point& target, const map<int, Snake>& allSnakes,
+                           const set<int>& exclude = {}) {
+    EnemyInfo best;
     for (const auto& [id, snake] : allSnakes) {
-        if (snake.isMySnake()) continue;
+        if (snake.isMySnake() || !snake.isAlive()) continue;
+        if (exclude.count(id)) continue;
         int d = target.distanceTo(snake.getHead());
-        if (d < minDist) {
-            minDist = d;
-            enemyId = id;
+        if (d < best.dist) {
+            best.dist = d;
+            best.id = id;
+            best.head = snake.getHead();
         }
     }
-    return {minDist, enemyId};
+    return best;
 }
 
 Snake fallingImitation(const Snake& snake, const LevelMap& levelMap, const map<int, Snake>& allSnakes) {
@@ -459,16 +465,34 @@ Snake fallingImitation(const Snake& snake, const LevelMap& levelMap, const map<i
     return result;
 }
 
-Point applyGravityConservative(const Point& pos, const LevelMap& levelMap) {
-    for (int y = pos.y; y < levelMap.height; y++) {
-        Point below(pos.x, y + 1);
-        if (below.y >= levelMap.height) return Point(pos.x, levelMap.height); // fell off
-        if (levelMap.levelMap[below.y][below.x] == PLATFORM_CHAR) return Point(pos.x, y);
-        if (levelMap.isBattery(below)) return Point(pos.x, y);
+// Fast version for DFS: works with body directly, uses occupied set instead of allSnakes
+int calcFallDistance(const vector<Point>& body, const LevelMap& levelMap, const set<Point>& occupied) {
+    int totalFall = levelMap.height;
+    for (const auto& bp : body) {
+        int fall = 0;
+        for (int y = 1; y < levelMap.height; y++) {
+            int belowY = bp.y + y;
+            if (belowY >= levelMap.height) { fall = levelMap.height; break; }
+            char cell = levelMap.levelMap[belowY][bp.x];
+            if (cell == PLATFORM_CHAR) { fall = y - 1; break; }
+            Point belowP(bp.x, belowY);
+            if (occupied.count(belowP)) { fall = y - 1; break; }
+            // Check if it's own body segment
+            bool ownBody = false;
+            for (const auto& ob : body) {
+                if (ob == belowP) { ownBody = true; break; }
+            }
+            if (ownBody) continue;
+            // Empty — keep falling
+        }
+        totalFall = min(totalFall, fall);
     }
-    return Point(pos.x, levelMap.height); // fell off
+    return totalFall;
 }
 
+void applyFall(vector<Point>& body, int fallDist) {
+    for (auto& p : body) p.y += fallDist;
+}
 
 // Flood fill from a point, no gravity. Returns number of reachable cells.
 // Used to detect dead ends: if reachable cells < snake body size, it's a trap.
@@ -504,22 +528,6 @@ int floodFillCount(const Point& start, const LevelMap& levelMap,
 
 // Count how many steps a snake can take before losing support.
 // Finds the first supported segment (closest to head), freeSteps = segments from there to tail.
-int calcFreeSteps(const Snake& snake, const LevelMap& levelMap, const map<int, Snake>& allSnakes) {
-    const auto& body = snake.getBody();
-    // body[0] = head, body[n-1] = tail
-    for (int i = 0; i < (int)body.size(); i++) {
-        Point below(body[i].x, body[i].y + 1);
-        if (below.y >= levelMap.height) continue;
-        CellType ct = whatInPoint(below, levelMap, allSnakes);
-        if (ct == PLATFORM || ct == BATTERY || ct == ENEMY_SNAKE) {
-            return (int)body.size() - 1 - i;
-        } else if (ct == MY_SNAKE && snake.isPartOfSnake(below) < 0) {
-            return (int)body.size() - 1 - i;
-        }
-    }
-    return 0; // no support at all
-}
-
 struct BatteryInfo {
     Point pos;
     int dist;
@@ -534,17 +542,38 @@ struct DfsResult {
     Point target;
 };
 
-// DFS: find actual path from start to target, with full body gravity simulation
-// Returns shortest path found within maxDepth, or pathLen=-1 if unreachable
+// DFS: find shortest path from snake to target on given map, with gravity simulation
 DfsResult dfsPathToTarget(const Snake& snake, const Point& target,
                           const LevelMap& levelMap, const map<int, Snake>& allSnakes,
                           int maxDepth = MAX_DFS_DEPTH) {
+
+    if (levelMap.isOutsideMap(target)) return DfsResult();
+    if ((int)snake.getBody().size() >= SNAKE_EFFECTIVE_LENGTH) maxDepth = max(1, maxDepth - 1);
     int myId = snake.getId();
-    // One copy, erase self — no per-node copying
     map<int, Snake> dfsSnakes(allSnakes);
     dfsSnakes.erase(myId);
 
-    vector<vector<bool>> visited(levelMap.height, vector<bool>(levelMap.width, false));
+    set<Point> occupied;
+    for (const auto& [id, s] : dfsSnakes) {
+        if (!s.isAlive()) continue;
+        const auto& body = s.getBody();
+        for (int i = 0; i < (int)body.size() - 1; i++)
+            occupied.insert(body[i]);
+    }
+
+    const int MARGIN = 3;
+    int vw = levelMap.width + 2 * MARGIN;
+    int vh = levelMap.height + 2 * MARGIN;
+    vector<vector<bool>> visited(vh, vector<bool>(vw, false));
+
+    // Helpers to convert to/from visited coords
+    auto vx = [&](int x) { return x + MARGIN; };
+    auto vy = [&](int y) { return y + MARGIN; };
+    auto validV = [&](const Point& p) {
+        int px = vx(p.x), py = vy(p.y);
+        return px >= 0 && px < vw && py >= 0 && py < vh;
+    };
+
     DfsResult best;
     best.target = target;
     vector<Point> currentPath;
@@ -574,36 +603,48 @@ DfsResult dfsPathToTarget(const Snake& snake, const Point& target,
             int dir = dirs[di];
             Point next = getCustomPoint(head, dir);
             if (levelMap.isOutsideMap(next)) continue;
-            if (visited[next.y][next.x]) continue;
+            if (!validV(next) || visited[vy(next.y)][vx(next.x)]) continue;
+            if (levelMap.levelMap[next.y][next.x] == PLATFORM_CHAR ||
+                occupied.count(next)) continue;
             bool eatingBattery = levelMap.isBattery(next);
-            if (isSolidCollision(next, levelMap, dfsSnakes, myId, eatingBattery)) continue;
 
-            // Build new body
+            // Battery target reached on contact (before gravity)
+            if (next == target && eatingBattery) {
+                int fd = firstDir < 0 ? dir : firstDir;
+                if (best.pathLen < 0 || (depth + 1) < best.pathLen) {
+                    best.pathLen = depth + 1;
+                    best.firstDir = fd;
+                    best.path = currentPath;
+                    best.path.push_back(next);
+                }
+                continue;
+            }
+
             vector<Point> newBody;
             newBody.push_back(next);
             int keepCount = eatingBattery ? (int)body.size() : (int)body.size() - 1;
             for (int i = 0; i < keepCount; i++) newBody.push_back(body[i]);
 
-            // Apply gravity via fallingImitation (no per-node copy)
-            Snake tempSnake(snake);
-            tempSnake.setBody(newBody);
-            Snake fallen = fallingImitation(tempSnake, levelMap, dfsSnakes);
-            vector<Point> settledBody = fallen.getBody();
+            int fallDist = calcFallDistance(newBody, levelMap, occupied);
+            vector<Point> settledBody = newBody;
+            applyFall(settledBody, fallDist);
             Point settledHead = settledBody[0];
 
             if (levelMap.isOutsideMap(settledHead)) continue;
             if (settledHead.y >= levelMap.height) continue;
-            if (visited[settledHead.y][settledHead.x]) continue;
 
-            visited[settledHead.y][settledHead.x] = true;
-            currentPath.push_back(settledHead);
-            dfs(settledBody, depth + 1, firstDir < 0 ? dir : firstDir);
-            currentPath.pop_back();
-            visited[settledHead.y][settledHead.x] = false;
+            if (validV(settledHead) && !visited[vy(settledHead.y)][vx(settledHead.x)]) {
+                visited[vy(settledHead.y)][vx(settledHead.x)] = true;
+                currentPath.push_back(settledHead);
+                dfs(settledBody, depth + 1, firstDir < 0 ? dir : firstDir);
+                currentPath.pop_back();
+                visited[vy(settledHead.y)][vx(settledHead.x)] = false;
+            }
         }
     };
 
-    visited[snake.getHead().y][snake.getHead().x] = true;
+    Point startHead = snake.getHead();
+    if (validV(startHead)) visited[vy(startHead.y)][vx(startHead.x)] = true;
     dfs(snake.getBody(), 0, -1);
     return best;
 }
@@ -611,7 +652,8 @@ DfsResult dfsPathToTarget(const Snake& snake, const Point& target,
 // Find all reachable batteries for a snake using DFS
 // Filters by Manhattan distance, runs DFS for each candidate
 vector<DfsResult> findBatteriesDfs(const Snake& snake, const LevelMap& levelMap,
-                                    const map<int, Snake>& allSnakes) {
+                                    const map<int, Snake>& allSnakes,
+                                    int dfsDepth = MAX_DFS_DEPTH) {
     vector<DfsResult> results;
     Point head = snake.getHead();
     int myId = snake.getId();
@@ -622,11 +664,15 @@ vector<DfsResult> findBatteriesDfs(const Snake& snake, const LevelMap& levelMap,
         return head.distanceTo(a) < head.distanceTo(b);
     });
 
+    int maxManDist = 5;
+    int checked = 0;
     for (const auto& bat : batteries) {
         int manDist = head.distanceTo(bat);
-        if (manDist > MAX_DFS_DEPTH) break; // sorted, rest are farther
+        if (manDist > maxManDist) break; // sorted, rest are farther
+        if (checked >= 3) break; // limit DFS calls
+        checked++;
 
-        DfsResult res = dfsPathToTarget(snake, bat, levelMap, allSnakes);
+        DfsResult res = dfsPathToTarget(snake, bat, levelMap, allSnakes, MAX_AVAILABLE_DISTANCE);
         if (res.pathLen >= 0) {
             results.push_back(res);
         }
@@ -639,211 +685,6 @@ vector<DfsResult> findBatteriesDfs(const Snake& snake, const LevelMap& levelMap,
 
     return results;
 }
-
-/* OLD BFS — commented out, replaced by DFS pathfinding
-vector<BatteryInfo> findAllBatteriesGravity(const Snake& snake, const LevelMap& levelMap,
-                                             int maxSteps, const map<int, Snake>& allSnakes) {
-    vector<BatteryInfo> result;
-    vector<vector<bool>> visited(levelMap.height, vector<bool>(levelMap.width, false));
-    Point start = snake.getHead();
-    auto checkBattery = [&](const Point& pos, int dist, int firstDir) {
-        if (!levelMap.isOutsideMap(pos) && levelMap.isBattery(pos)) {
-            result.push_back({pos, dist, firstDir});
-        }
-    };
-
-    struct FullSimNode {
-        Snake snake;
-        int steps;
-        int firstDir;
-    };
-
-    auto expandFullSim = [&](const vector<FullSimNode>& sources, bool isFirstDepth) {
-        vector<FullSimNode> nextNodes;
-        for (const auto& node : sources) {
-            if (node.steps >= maxSteps) continue;
-            Point head = node.snake.getHead();
-
-            for (int dir = 0; dir < 4; dir++) {
-                int firstDir = isFirstDepth ? dir : node.firstDir;
-                Point newHead = getCustomPoint(head, dir);
-                if (levelMap.isOutsideMap(newHead)) continue;
-                if (isSolidCollision(newHead, levelMap, allSnakes, node.snake.getId())) continue;
-
-                Snake moved(node.snake);
-                moved.updateHead(newHead, levelMap.isBattery(newHead));
-                map<int, Snake> tempSnakes(allSnakes);
-                tempSnakes.erase(node.snake.getId());
-                tempSnakes.insert(make_pair(moved.getId(), moved));
-                Snake settled = fallingImitation(moved, levelMap, tempSnakes);
-                Point settledHead = settled.getHead();
-
-                if (levelMap.isOutsideMap(settledHead)) continue;
-                if (visited[settledHead.y][settledHead.x]) continue;
-                visited[settledHead.y][settledHead.x] = true;
-
-                int fallDist = abs(settledHead.y - newHead.y);
-                int stepCost = node.steps + 1 + (int)(fallDist * FALL_COST_FACTOR);
-
-                checkBattery(newHead, stepCost, firstDir);
-                if (settledHead != newHead) checkBattery(settledHead, stepCost, firstDir);
-
-                nextNodes.push_back({settled, stepCost, firstDir});
-            }
-        }
-        return nextNodes;
-    };
-
-    // --- Phase 1: full body simulation ---
-    vector<FullSimNode> currentNodes = {{snake, 0, -1}};
-    queue<tuple<Point, int, int>> phase2Queue;
-
-    for (int depth = 1; depth <= min(FULL_SIM_DEPTH, maxSteps); depth++) {
-        currentNodes = expandFullSim(currentNodes, depth == 1);
-    }
-
-    for (const auto& node : currentNodes) {
-        phase2Queue.push({node.snake.getHead(), node.steps, node.firstDir});
-    }
-
-    // --- Phase 2: conservative BFS ---
-    while (!phase2Queue.empty()) {
-        auto [pos, dist, firstDir] = phase2Queue.front(); phase2Queue.pop();
-        if (dist >= maxSteps) continue;
-
-        for (int dir = 0; dir < 4; dir++) {
-            Point newHead = getCustomPoint(pos, dir);
-            if (levelMap.isOutsideMap(newHead)) continue;
-            if (levelMap.levelMap[newHead.y][newHead.x] == PLATFORM_CHAR) continue;
-            bool blocked = false;
-            for (const auto& [id, s] : allSnakes) {
-                if (s.isMySnake()) continue;
-                if (s.isPartOfSnake(newHead) >= 0) { blocked = true; break; }
-            }
-            if (blocked) continue;
-
-            Point settledPos = applyGravityConservative(newHead, levelMap);
-            if (settledPos.y >= levelMap.height) continue;
-            if (visited[settledPos.y][settledPos.x]) continue;
-            visited[settledPos.y][settledPos.x] = true;
-
-            int fallDist = abs(settledPos.y - newHead.y);
-            int stepCost = dist + 1 + (int)(fallDist * FALL_COST_FACTOR);
-
-            checkBattery(newHead, stepCost, firstDir);
-            if (settledPos != newHead) checkBattery(settledPos, stepCost, firstDir);
-
-            phase2Queue.push({settledPos, stepCost, firstDir});
-        }
-    }
-
-    return result;
-}
-
-// Alternative BFS with support-aware gravity (freeSteps).
-// At Phase 1 end, calculates how many steps the snake can take before losing support.
-// Phase 2 skips gravity for those steps, then applies conservative gravity.
-vector<BatteryInfo> findAllBatteriesFreeSteps(const Snake& snake, const LevelMap& levelMap,
-                                              int maxSteps, const map<int, Snake>& allSnakes) {
-    vector<BatteryInfo> result;
-    vector<vector<bool>> visited(levelMap.height, vector<bool>(levelMap.width, false));
-    auto checkBattery = [&](const Point& pos, int dist, int firstDir) {
-        if (!levelMap.isOutsideMap(pos) && levelMap.isBattery(pos)) {
-            result.push_back({pos, dist, firstDir});
-        }
-    };
-
-    struct FullSimNode {
-        Snake snake;
-        int steps;
-        int firstDir;
-    };
-
-    auto expandFullSim = [&](const vector<FullSimNode>& sources, bool isFirstDepth) {
-        vector<FullSimNode> nextNodes;
-        for (const auto& node : sources) {
-            if (node.steps >= maxSteps) continue;
-            Point head = node.snake.getHead();
-            for (int dir = 0; dir < 4; dir++) {
-                int firstDir = isFirstDepth ? dir : node.firstDir;
-                Point newHead = getCustomPoint(head, dir);
-                if (levelMap.isOutsideMap(newHead)) continue;
-                if (isSolidCollision(newHead, levelMap, allSnakes, node.snake.getId())) continue;
-                Snake moved(node.snake);
-                moved.updateHead(newHead, levelMap.isBattery(newHead));
-                map<int, Snake> tempSnakes(allSnakes);
-                tempSnakes.erase(node.snake.getId());
-                tempSnakes.insert(make_pair(moved.getId(), moved));
-                Snake settled = fallingImitation(moved, levelMap, tempSnakes);
-                Point settledHead = settled.getHead();
-                if (levelMap.isOutsideMap(settledHead)) continue;
-                if (visited[settledHead.y][settledHead.x]) continue;
-                visited[settledHead.y][settledHead.x] = true;
-                int fallDist = abs(settledHead.y - newHead.y);
-                int stepCost = node.steps + 1 + (int)(fallDist * FALL_COST_FACTOR);
-                checkBattery(newHead, stepCost, firstDir);
-                if (settledHead != newHead) checkBattery(settledHead, stepCost, firstDir);
-                nextNodes.push_back({settled, stepCost, firstDir});
-            }
-        }
-        return nextNodes;
-    };
-
-    // --- Phase 1: full body simulation ---
-    vector<FullSimNode> currentNodes = {{snake, 0, -1}};
-    queue<tuple<Point, int, int, int>> phase2Queue; // pos, dist, firstDir, freeSteps
-
-    for (int depth = 1; depth <= min(FULL_SIM_DEPTH, maxSteps); depth++) {
-        currentNodes = expandFullSim(currentNodes, depth == 1);
-    }
-
-    for (const auto& node : currentNodes) {
-        int freeSteps = calcFreeSteps(node.snake, levelMap, allSnakes);
-        phase2Queue.push({node.snake.getHead(), node.steps, node.firstDir, freeSteps});
-    }
-
-    // --- Phase 2: BFS with support-aware gravity ---
-    while (!phase2Queue.empty()) {
-        auto [pos, dist, firstDir, freeSteps] = phase2Queue.front(); phase2Queue.pop();
-        if (dist >= maxSteps) continue;
-
-        for (int dir = 0; dir < 4; dir++) {
-            Point newHead = getCustomPoint(pos, dir);
-            if (levelMap.isOutsideMap(newHead)) continue;
-            if (levelMap.levelMap[newHead.y][newHead.x] == PLATFORM_CHAR) continue;
-            bool blocked = false;
-            for (const auto& [id, s] : allSnakes) {
-                if (s.isMySnake()) continue;
-                if (s.isPartOfSnake(newHead) >= 0) { blocked = true; break; }
-            }
-            if (blocked) continue;
-
-            Point settledPos = newHead;
-            int nextFreeSteps = 0;
-            // if (freeSteps > 0) {
-            //     settledPos = newHead;
-            //     nextFreeSteps = freeSteps - 1;
-            // } else {
-            //     settledPos = applyGravityConservative(newHead, levelMap);
-            //     nextFreeSteps = 0;
-            // }
-            if (settledPos.y >= levelMap.height) continue;
-            if (visited[settledPos.y][settledPos.x]) continue;
-            visited[settledPos.y][settledPos.x] = true;
-
-            int fallDist = abs(settledPos.y - newHead.y);
-            int stepCost = dist + 1 + (int)(fallDist * FALL_COST_FACTOR);
-
-            checkBattery(newHead, stepCost, firstDir);
-            if (settledPos != newHead) checkBattery(settledPos, stepCost, firstDir);
-
-            phase2Queue.push({settledPos, stepCost, firstDir, nextFreeSteps});
-        }
-    }
-
-    return result;
-}
-END OLD BFS */
 
 class IScorer {
     public:
@@ -892,17 +733,6 @@ class IScorer {
             return fallingImitation(ctx.snake, ctx.levelMap, ctx.allSnakes);
         }
 
-        bool isLoopOnPlace(const Snake& snake, const LevelMap& levelMap,
-                        const map<int, Snake>& allSnakes, int direction) const {
-            const Point newHead = getCustomPoint(snake.getHead(), direction);
-            if (!hasSupportAfterMove(snake, newHead, direction, levelMap, allSnakes)) {
-                auto ctx = simulateMove(snake, newHead, levelMap, allSnakes, true);
-                Snake fallenSnake = fallingImitation(ctx.snake, ctx.levelMap, ctx.allSnakes);
-                if (fallenSnake.getHead() == snake.getHead()) return true;
-            }
-            return false;
-        }
-
         int getOutOfBoundsPenalty(const Point& p, const LevelMap& levelMap) {
             if (p.x >= 0 && p.x < levelMap.width && 
                 p.y >= 0 && p.y < levelMap.height) {
@@ -927,7 +757,6 @@ class IScorer {
             Point newHead = getCustomPoint(snake.getHead(), direction);
             auto ctx = simulateMove(snake, newHead, levelMap, allSnakes);
             auto [escapeRoutes, additionalEscapeRoutes] = countEscapeRoutes(newHead, ctx.levelMap, ctx.allSnakes, snake.getId());
-            cerr<<"AER: " << additionalEscapeRoutes << ", ";
             return make_pair(escapeRoutes < ESCAPE_ROUTES || additionalEscapeRoutes < (ESCAPE_ROUTES + 1), additionalEscapeRoutes);
         }
 
@@ -946,6 +775,7 @@ class IScorer {
 class SafetyScorer : public IScorer {
     // Working normal
     private:
+
         // Count how many turns until the snake loses its last support point
         int countSupportTurnsLeft(const Snake& snake, const LevelMap& levelMap,
                                    const map<int, Snake>& allSnakes) const {
@@ -977,18 +807,18 @@ class SafetyScorer : public IScorer {
             return false;
         }
 
-        int calcAerBonus(int aer, const Point& head, const Point& target,
+        int calcAerBonus(int additionalEscapeRoutes, const Point& head, const Point& target,
                          const map<int, Snake>& allSnakes) {
-            int headDist = findClosestEnemy(head, allSnakes).first;
-            int pointDist = findClosestEnemy(target, allSnakes).first;
+            int headDist = findClosestEnemy(head, allSnakes).dist;
+            int pointDist = findClosestEnemy(target, allSnakes).dist;
             int enemyDist = pointDist;
             if (pointDist > headDist) enemyDist += 1;  // moving away, relax
             if (enemyDist <= AER_ENEMY_DISTANCE) {
                 // Near enemy: penalize low escape routes, cap bonus
-                if (aer < 3) return (aer - 3) * ROUTE_FINDING_BONUS;
+                if (additionalEscapeRoutes < 3) return (additionalEscapeRoutes - 3) * ROUTE_FINDING_BONUS;
                 return 2 * ROUTE_FINDING_BONUS;
             }
-            return min(aer, 2) * ROUTE_FINDING_BONUS;
+            return min(additionalEscapeRoutes, 2) * ROUTE_FINDING_BONUS;
         }
 
     public:
@@ -1023,7 +853,6 @@ class SafetyScorer : public IScorer {
                     auto [escapeRoutes, additionalEscape] = countEscapeRoutes(landedHead, levelMap, allSnakes, snake.getId(), eatingBattery);
                     if (escapeRoutes < ESCAPE_ROUTES || additionalEscape < (ESCAPE_ROUTES + 1)) {
                         totalBonus += TRAPPED_FINE;
-                        //cerr << "[FALL_TRAP] ";
                     } else {
                         totalBonus += calcAerBonus(additionalEscape, head, landedHead, allSnakes);
                     }
@@ -1032,7 +861,6 @@ class SafetyScorer : public IScorer {
                 const auto result = willBeTrappedNextTurn(snake, levelMap, allSnakes, direction, eatingBattery);
                 if (result.first) {
                     totalBonus += TRAPPED_FINE;
-                    //cerr << "[TRAPPED] ";
                 } else {
                     totalBonus += calcAerBonus(result.second, head, newHead, allSnakes);
                 }
@@ -1040,10 +868,8 @@ class SafetyScorer : public IScorer {
             // Flood fill check: detect dead ends regardless of fall/no-fall
             if (totalBonus > DEATH_FINE) {
                 int space = floodFillCount(newHead, levelMap, allSnakes, snake.getId());
-                //cerr << "[FLOOD " << newHead << " " << space << "/" << snake.getBody().size() << "] ";
                 if (space < (int)snake.getBody().size() * 3 / 2 + 1) {
                     totalBonus = TRAPPED_FINE;
-                    //cerr << "[FLOOD_TRAP] ";
                 }
             }
             totalBonus += getOutOfBoundsPenalty(newHead, levelMap);
@@ -1054,15 +880,12 @@ class SafetyScorer : public IScorer {
                 if (supportLeft < SUPPORT_TURNS_THRESHOLD) {
                     if (hasNewSupport(newHead, levelMap)) {
                         totalBonus += SUPPORT_BONUS;
-                        //cerr << "[S+" << supportLeft << "] ";
                     } else {
                         totalBonus += -SUPPORT_BONUS;
-                        //cerr << "[!!! " << supportLeft << "] ";
                     }
                 }
             }
 
-            //cerr << "Safety: " << totalBonus << ", ";
             return totalBonus;
         }
         
@@ -1071,12 +894,16 @@ class SafetyScorer : public IScorer {
 class BatteryScorer : public IScorer {
     public:
 
-        void clearCache() { cachedSnakeId = -1; cachedDfs.clear(); claimedBatteries.clear(); }
+        void clearCache() { cachedSnakeId = -1; cachedDfs.clear(); claimedBatteries.clear(); assignedBatteries.clear(); }
+
         void setCache(int snakeId, const vector<DfsResult>& dfs) {
             cachedSnakeId = snakeId;
             cachedDfs = dfs;
         }
-        void setEnemyBfs(const map<Point, int>* bfs) { enemyBfsDist = bfs; }
+
+        // Pre-assign battery to specific snake — only that snake can score it
+        void assignBattery(const Point& pos, int snakeId) { assignedBatteries[pos] = snakeId; }
+
         int getEnemyDist(const Point& bat) const {
             if (!enemyBfsDist) return 9999;
             auto it = enemyBfsDist->find(bat);
@@ -1096,6 +923,7 @@ class BatteryScorer : public IScorer {
                 [](const DfsResult& a, const DfsResult& b) { return a.pathLen < b.pathLen; });
             for (const auto& r : inDir) {
                 if (claimedBatteries.count(r.target)) continue;
+                if (isAssignedToOther(r.target, cachedSnakeId)) continue;
                 if (getEnemyDist(r.target) < r.pathLen) continue;
                 return r.target;
             }
@@ -1104,43 +932,38 @@ class BatteryScorer : public IScorer {
 
         int evaluate(const Snake& snake, const LevelMap& levelMap,
                     const map<int, Snake>& allSnakes, int direction) override {
-            cerr << "Battery: ";
-            if (isLoopOnPlace(snake, levelMap, allSnakes, direction)) {
-                cerr << "LOOP, ";
-                return 0;
-            }
-
             vector<DfsResult> inDir;
             for (const auto& r : cachedDfs) {
                 if (r.firstDir == direction) inDir.push_back(r);
             }
-            if (inDir.empty()) { cerr << "0, "; return 0; }
+            if (inDir.empty()) return 0;
             sort(inDir.begin(), inDir.end(),
                 [](const DfsResult& a, const DfsResult& b) { return a.pathLen < b.pathLen; });
 
             int totalBonus = 0;
             for (const auto& r : inDir) {
-                if (claimedBatteries.count(r.target)) {
-                    cerr << "[" << r.target << " CLAIMED] ";
-                    continue;
-                }
+                if (r.pathLen >= MAX_AVAILABLE_DISTANCE) continue;  // only short paths
+                if (claimedBatteries.count(r.target)) continue;
+                if (isAssignedToOther(r.target, snake.getId())) continue;
                 int enemyDist = getEnemyDist(r.target);
-                if (enemyDist < r.pathLen) {
-                    cerr << "[" << r.target << " ENEMY(" << enemyDist << "<" << r.pathLen << ")] ";
-                    continue;
-                }
-                cerr << "[" << r.target << " d=" << r.pathLen << " OK] ";
-                totalBonus = BASE_BONUS - (r.pathLen - 1) * DECAY_PER_STEP;
+                if (enemyDist < r.pathLen) continue;
+                totalBonus = BASE_BONUS;
                 break;
             }
-            cerr << totalBonus << ", ";
             return totalBonus;
         }
 
     private:
+        bool isAssignedToOther(const Point& bat, int myId) const {
+            auto it = assignedBatteries.find(bat);
+            if (it == assignedBatteries.end()) return false;
+            return it->second != myId;
+        }
+
         int cachedSnakeId = -1;
         vector<DfsResult> cachedDfs;
         set<Point> claimedBatteries;
+        map<Point, int> assignedBatteries;  // battery → assigned snakeId
         const map<Point, int>* enemyBfsDist = nullptr;
 };
 
@@ -1156,554 +979,104 @@ struct BatteryCluster {
     }
 };
 
-class ExplorationScorer : public IScorer {
-    // Working excellent
-    public:
-        ExplorationScorer(int zones = INITIAL_ZONES_SPLITTING) : numZones(zones) {}
+vector<BatteryCluster> clusterBatteries(const vector<Point>& batteries, int threshold, int maxClusterSize = MAX_CLUSTER_SIZE) {
+    map<Point, bool> used;
+    for (const auto& b : batteries) used[b] = false;
 
-        void setClusters(const vector<BatteryCluster>* c) { clustersPtr = c; }
-
-        int evaluate(const Snake& snake, const LevelMap& levelMap,
-                    const map<int, Snake>& allSnakes, int direction) override {
-            int comB = centerOfMassBonus(snake, direction);
-            int clB = nearestClusterBonus(snake, direction);
-            int exploringScore = comB + clB;
-            //cerr << "Exploring: " << exploringScore << "(c=" << comB << " cl=" << clB << "), ";
-            return exploringScore;
-        }
-
-        void InitZones(const LevelMap& levelMap, const vector<int>& mySnakeIds, map<int, Snake>& allSnakes) {
-
-            batteries.clear();
-            initZonesBoundary(levelMap.levelMap.at(0).length());
-            for (int i=0; i < numZones; ++i) {
-                setBattariesInZone(i, levelMap);
-                calculateCenter(i);
-            }
-            setZonesForSnakes(mySnakeIds, allSnakes);
-            updateCenterOfMass(levelMap);
-        }
-
-    private:
-        
-        void setBattariesInZone(const int zone, const LevelMap& levelMap) {
-
-            int zoneStart = zoneBoundaries.at(zone).first,
-                zoneEnd = zoneBoundaries.at(zone).second;
-            int totalBatteriesInZone = 0;
-            for (auto battery : levelMap.getPowerElements()) {
-                if (battery.x >= zoneStart && battery.x < zoneEnd ) {
-                    batteries[zone].push_back(battery);
-                    ++totalBatteriesInZone;
-                }
-            }
-            if (!totalBatteriesInZone) {
-                --numZones;
-                int height = levelMap.levelMap.size();
-                Point draft((zoneStart + zoneEnd)/2, height/2);
-                batteries[zone].push_back(draft);
-            }
-        }
-
-        // Init zone boundaries based on map width
-        void initZonesBoundary(int mapWidth) {
-            zoneBoundaries.clear();
-            int zoneWidth = mapWidth / numZones;
-            
-            int startZone = 0;
-            for (int i = 0; i < numZones; i++) {
-                pair<int,int> bounds = {startZone, startZone + zoneWidth};
-                zoneBoundaries.push_back(bounds);
-                startZone += zoneWidth;
-            }
-        }
-
-        void calculateCenter(const int zone) {
-            auto batteriesVector = batteries.at(zone);
-
-            int totalX = 0, totalY = 0, totalAmount = 0;
-            for (int i = 0; i < batteriesVector.size(); ++i) {
-                totalX += batteriesVector[i].x;
-                totalY += batteriesVector[i].y;
-                ++totalAmount;
-            }
-            
-            zoneCenter[zone] = Point(totalX/totalAmount, totalY/totalAmount);
-            // markPoint(zoneCenter.at(zone));
-        }
-
-        void setZonesForSnakes(const vector<int>& mySnakeIds, map<int, Snake> allSnakes) {
-            snakesInZone.clear();
-            snakeAssignment.clear();
-
-            // Init snake count per zone
-            for (int i = 0; i < (int)zoneBoundaries.size(); ++i) {
-                snakesInZone[i] = 0;
-            }
-
-            // Greedy assignment: pick best (snake, zone) pair each iteration
-            set<int> unassigned(mySnakeIds.begin(), mySnakeIds.end());
-            while (!unassigned.empty()) {
-                int bestSnakeId = -1;
-                int bestZone = -1;
-                double bestScore = -1;
-
-                for (int snakeId : unassigned) {
-                    auto it = allSnakes.find(snakeId);
-                    if (it == allSnakes.end()) continue;
-                    Point head = it->second.getHead();
-
-                    for (int z = 0; z < (int)zoneBoundaries.size(); ++z) {
-                        int battCount = batteries[z].size();
-                        if (battCount == 0) continue;
-
-                        // Value = batteries / (already assigned + 1), penalized by distance
-                        double value = (double)battCount / (snakesInZone[z] + 1);
-                        int dist = head.distanceTo(zoneCenter[z]);
-                        double score = value / (dist + 1);
-
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestSnakeId = snakeId;
-                            bestZone = z;
-                        }
-                    }
-                }
-
-                if (bestSnakeId == -1) break;
-
-                snakeAssignment[bestSnakeId] = bestZone;
-                snakesInZone[bestZone]++;
-                unassigned.erase(bestSnakeId);
-            }
-
-            // Fallback for unassigned (all zones empty) — zone 0
-            for (int snakeId : unassigned) {
-                snakeAssignment[snakeId] = 0;
-                snakesInZone[0]++;
-            }
-        }
-
-        vector<pair<int,int>> zoneBoundaries;  // zone X boundaries
-        map<int, vector<Point>> batteries;
-        map<int,Point> zoneCenter;
-        int numZones;
-        map<int,int> snakesInZone;
-        map<int,int> snakeAssignment;  // snakeId -> assigned zone
-        Point batteryCom;
-        const vector<BatteryCluster>* clustersPtr = nullptr;
-
-        void updateCenterOfMass(const LevelMap& levelMap) {
-            auto allBats = levelMap.getPowerElements();
-            if (!allBats.empty()) {
-                int tx = 0, ty = 0;
-                for (const auto& b : allBats) { tx += b.x; ty += b.y; }
-                batteryCom = Point(tx / (int)allBats.size(), ty / (int)allBats.size());
-            }
-        }
-
-        int nearestClusterBonus(const Snake& snake, int direction) {
-            if (!clustersPtr || clustersPtr->empty()) return 0;
-            Point head = snake.getHead();
-            int bestDist = 9999;
-            Point bestCenter;
-            for (const auto& c : *clustersPtr) {
-                if (c.batteries.empty()) continue;
-                int d = head.distanceTo(c.center);
-                if (d < bestDist) { bestDist = d; bestCenter = c.center; }
-            }
-            if (bestDist == 9999) return 0;
-            int oldDist = head.distanceTo(bestCenter);
-            int newDist = getCustomPoint(head, direction).distanceTo(bestCenter);
-            if (newDist < oldDist) return NEAREST_CLUSTER_BONUS;
-            if (newDist > oldDist) return -NEAREST_CLUSTER_BONUS;
-            return 0;
-        }
-
-        int centerOfMassBonus(const Snake& snake, int direction) {
-            int oldDist = snake.getHead().distanceTo(batteryCom);
-            int newDist = getCustomPoint(snake.getHead(), direction).distanceTo(batteryCom);
-            if (newDist < oldDist) return COM_BONUS;
-            if (newDist > oldDist) return -COM_BONUS;
-            return 0;
-        }
-};
-
-class AntiLoopScorer : public IScorer {
-    // Working normal
-    private:
-        map<int, pair<Point, Direction>> lastState;  // snakeId -> (position, direction)
-        map<int, int> loopCount;  // consecutive loop count
-
-
-    public:
-
-        int evaluate(const Snake& snake, const LevelMap& levelMap,
-                    const map<int, Snake>& allSnakes, int direction) override {
-
-            int totalBonus = 0;
-            {
-                int id = snake.getId();
-                Point currentHead = snake.getHead();
-                if (lastState.count(id)) {
-                    auto [lastPos, lastDir] = lastState[id];
-                    if (lastPos == currentHead && lastDir == snake.getMovingDirection()) {
-                        if (direction == lastDir) {
-                            int penalty = LOOP_PENALTY * loopCount[id];
-                            if (penalty < MAX_LOOP_PENALTY) penalty = MAX_LOOP_PENALTY;
-                            totalBonus += penalty;
-                        }
-                    }
-                }
-            }
-            {
-                // Skip loop-on-place penalty if move eats a battery
-                Point newHead = getCustomPoint(snake.getHead(), direction);
-                if (!levelMap.isBattery(newHead)) {
-                    totalBonus += isLoopOnPlace(snake, levelMap, allSnakes, direction) ? LOOP_ON_PLACE_PENALTY : 0;
-                }
-            }
-
-            // Long snakes: reduce loop penalty (they have established routes)
-            if ((int)snake.getBody().size() >= 6) totalBonus /= 3;
-
-            //cerr << "Loop: " << totalBonus << ", ";
-            return totalBonus;
-        }
-
-        void recordPosition(int id, Point headPos, const Direction& chosenDir) {
-
-            if (headPos != lastState[id].first || chosenDir != lastState[id].second)
-                loopCount[id] = 0;
-            lastState[id] = {headPos, chosenDir};
-        }
-
-        void recordDirection(int id, const Direction& chosenDir, const Point& headPos) {
-
-            if (headPos == lastState[id].first && chosenDir == lastState[id].second) {
-                loopCount[id]++;
-            } else {
-                loopCount[id] = 0;
-            }
-        }
-
-};
-
-class HuntScorer : public IScorer {
-    public:
-        // Cache enemy BFS distances: for each battery, min BFS dist from any enemy
-        map<Point, int> enemyBfsDist;
-
-        void updateEnemyBfs(const LevelMap& levelMap, const map<int, Snake>& allSnakes) {
-            enemyBfsDist.clear();
-            // TODO: replace with DFS or Manhattan-based enemy distance
-            // for (const auto& [id, snake] : allSnakes) {
-            //     if (snake.isMySnake() || !snake.isAlive()) continue;
-            //     auto batteries = findAllBatteriesFreeSteps(snake, levelMap, MAX_BFS_STEPS, allSnakes);
-            //     for (const auto& b : batteries) {
-            //         auto it = enemyBfsDist.find(b.pos);
-            //         if (it == enemyBfsDist.end() || b.dist < it->second) {
-            //             enemyBfsDist[b.pos] = b.dist;
-            //         }
-            //     }
-            // }
-        }
-
-        int getEnemyDist(const Point& bat) const {
-            auto it = enemyBfsDist.find(bat);
-            return it != enemyBfsDist.end() ? it->second : 9999;
-        }
-
-        void setMyBatteries(const vector<BatteryInfo>& batteries) { myBatteries = batteries; }
-
-        int evaluate(const Snake& snake, const LevelMap& levelMap,
-                    const map<int, Snake>& allSnakes, int direction) override {
-
-            int totalBonus = 0;
-
-            // Filter batteries reachable in this direction
-            for (const auto& b : myBatteries) {
-                if (b.firstDir != direction) continue;
-                if (b.dist > ENEMY_DISTANCE) continue;
-
-                int enemyDist = getEnemyDist(b.pos);
-                if (enemyDist > ENEMY_DISTANCE) continue;
-                //cerr << "[" << b.pos << " myD=" << b.dist << " enD=" << enemyDist << "] ";
-
-                // We're closer or equal — intercept bonus
-                if (b.dist <= enemyDist) {
-                    int interceptBonus = PREVENTING_ENEMY_BONUS / (b.dist + 1);
-                    totalBonus += interceptBonus;
-                }
-            }
-
-            //cerr << "Hunt:" << totalBonus << ", ";
-            return totalBonus;
-        }
-
-    private:
-        vector<BatteryInfo> myBatteries;
-};
-
-class BodyBlockScorer : public IScorer {
-    public:
-        int evaluate(const Snake& snake, const LevelMap& levelMap,
-                    const map<int, Snake>& allSnakes, int direction) override {
-            //cerr << "Block:0, ";
-            return 0;
-        }
-};
-
-// Old clustering: by proximity to cluster center (no transitive chaining)
-vector<BatteryCluster> clusterBatteriesOld(const vector<Point>& batteries, int threshold) {
     vector<BatteryCluster> clusters;
+
+    // Phase 1: build clusters from seeds (skip loners)
     for (const auto& bat : batteries) {
-        int bestCluster = -1;
-        int bestDist = 9999;
-        for (int i = 0; i < (int)clusters.size(); i++) {
-            int d = bat.distanceTo(clusters[i].center);
-            if (d <= threshold && d < bestDist) {
-                bestDist = d;
-                bestCluster = i;
-            }
-        }
-        if (bestCluster >= 0) {
-            clusters[bestCluster].batteries.push_back(bat);
-            clusters[bestCluster].recalcCenter();
-        } else {
-            clusters.push_back({{bat}, bat});
-        }
-    }
-    // Merge clusters whose centers are close
-    bool merged = true;
-    while (merged) {
-        merged = false;
-        for (int i = 0; i < (int)clusters.size() && !merged; i++) {
-            for (int j = i + 1; j < (int)clusters.size() && !merged; j++) {
-                if (clusters[i].center.distanceTo(clusters[j].center) <= threshold) {
-                    for (const auto& bp : clusters[j].batteries)
-                        clusters[i].batteries.push_back(bp);
-                    clusters[i].recalcCenter();
-                    clusters.erase(clusters.begin() + j);
-                    merged = true;
-                }
-            }
-        }
-    }
-    return clusters;
-}
+        if (used[bat]) continue;
+        BatteryCluster c;
+        c.batteries.push_back(bat);
+        c.center = bat;
 
-// Cluster batteries with max size limit
-vector<BatteryCluster> clusterBatteries(const vector<Point>& batteries, int threshold) {
-    int maxClusterSize = 1 + (int)batteries.size() / CLUSTER_DISTANCE;
-    vector<Point> sorted = batteries;
-    sort(sorted.begin(), sorted.end(), [](const Point& a, const Point& b) {
-        return (a.x + a.y) != (b.x + b.y) ? (a.x + a.y) < (b.x + b.y) : a.x < b.x;
-    });
-    vector<BatteryCluster> clusters;
-    for (const auto& bat : sorted) {
+        // Add nearby unused batteries (check distance to CoM)
+        for (const auto& other : batteries) {
+            if (used[other] || other == bat) continue;
+            if ((int)c.batteries.size() >= maxClusterSize) break;
+            if (other.distanceTo(c.center) <= threshold) {
+                c.batteries.push_back(other);
+                c.recalcCenter();
+            }
+        }
+
+        for (const auto& b : c.batteries) used[b] = true;
+        clusters.push_back(c);
+    }
+
+    // Phase 2: assign remaining batteries to nearest cluster by CoM (no threshold)
+    for (const auto& bat : batteries) {
+        if (used[bat]) continue;
         int bestCluster = -1;
         int bestDist = 9999;
         for (int i = 0; i < (int)clusters.size(); i++) {
             if ((int)clusters[i].batteries.size() >= maxClusterSize) continue;
             int d = bat.distanceTo(clusters[i].center);
-            if (d <= threshold && d < bestDist) {
-                bestDist = d;
-                bestCluster = i;
-            }
+            if (d < bestDist) { bestDist = d; bestCluster = i; }
         }
         if (bestCluster >= 0) {
             clusters[bestCluster].batteries.push_back(bat);
             clusters[bestCluster].recalcCenter();
+            used[bat] = true;
         } else {
+            // All clusters full — new cluster
             clusters.push_back({{bat}, bat});
+            used[bat] = true;
         }
     }
-    // Merge clusters whose centers are close (respecting max size)
-    bool merged = true;
-    while (merged) {
-        merged = false;
-        for (int i = 0; i < (int)clusters.size() && !merged; i++) {
-            for (int j = i + 1; j < (int)clusters.size() && !merged; j++) {
-                if (clusters[i].center.distanceTo(clusters[j].center) <= threshold
-                    && (int)(clusters[i].batteries.size() + clusters[j].batteries.size()) <= maxClusterSize) {
-                    for (const auto& bp : clusters[j].batteries)
-                        clusters[i].batteries.push_back(bp);
-                    clusters[i].recalcCenter();
-                    clusters.erase(clusters.begin() + j);
-                    merged = true;
-                }
-            }
-        }
-    }
+
     return clusters;
 }
 
 class ClusterScorer : public IScorer {
-    struct Assignment {
-        int snakeId = -1;
-        int enemyId = -1;
-        int lockTurnsLeft = 0;
-        Point target;
-        Point enemyHead;
-        bool active = false;
-        int clusterIdx = -1;
-    };
 
-    Assignment slots[MAX_CHOSEN_SLOTS];
+    
     int turnCount = 0;
     string lastLog;
     vector<BatteryCluster> clusters;
-    const map<Point, int>* enemyBfsDist = nullptr;
-
-    // Find closest snake to com, excluding ids in `exclude`
-    int findClosestSnake(const Point& com, const vector<int>& mySnakeIds,
-                         const map<int, Snake>& allSnakes, const set<int>& exclude) {
-        int bestDist = 9999, bestId = -1;
-        for (int id : mySnakeIds) {
-            if (exclude.count(id)) continue;
-            auto it = allSnakes.find(id);
-            if (it == allSnakes.end()) continue;
-            if ((int)it->second.getBody().size() <= 4) continue;  // too short for chosen role
-            int d = it->second.getHead().distanceTo(com);
-            if (d < bestDist) { bestDist = d; bestId = id; }
-        }
-        return bestId;
-    }
-
-    // Find closest enemy to com, excluding ids in `exclude`
-    Point findClosestEnemyHead(const Point& com, const map<int, Snake>& allSnakes,
-                               const set<int>& exclude) {
-        int bestDist = 9999;
-        Point bestHead;
-        for (const auto& [id, s] : allSnakes) {
-            if (s.isMySnake() || !s.isAlive()) continue;
-            if (exclude.count(id)) continue;
-            int d = s.getHead().distanceTo(com);
-            if (d < bestDist) { bestDist = d; bestHead = s.getHead(); }
-        }
-        return bestHead;
-    }
+    bool clustersInitialized = false;
 
     // Calculate CoM of battery list
     Point calcCoM(const vector<Point>& batteries) {
+        if (batteries.empty()) return Point(-1, -1);
         int tx = 0, ty = 0;
         for (const auto& b : batteries) { tx += b.x; ty += b.y; }
         return Point(tx / (int)batteries.size(), ty / (int)batteries.size());
     }
 
-    // Pick target: find best cluster → finalMid → closest battery
-    Point pickTarget(const Point& snakeHead, const Point& enemyHead, const Point& mid,
-                     const vector<BatteryCluster>& clusters, const vector<Point>& batteries,
-                     const map<int, Snake>& allSnakes, const set<int>& usedClusters,
-                     int& outClusterIdx) {
-        // Best cluster closest to mid, skip taken clusters
-        int bestDist = 9999;
-        outClusterIdx = -1;
-        for (int i = 0; i < (int)clusters.size(); i++) {
-            if (usedClusters.count(i)) continue;
-            int d = clusters[i].center.distanceTo(mid);
-            if (d < bestDist) { bestDist = d; outClusterIdx = i; }
+
+    void initClusters(const vector<Point>& batteries) {
+        int dist = CLUSTER_DISTANCE;
+        int minClusters = 4;
+        int prevCount = 0;
+        // Too few → decrease distance
+        for (int i = 0; i < 10; i++) {
+            clusters = clusterBatteries(batteries, dist);
+            int count = (int)clusters.size();
+            if (count >= minClusters || dist <= 1) break;
+            if (count <= prevCount) break;
+            prevCount = count;
+            dist--;
+            minClusters++;
         }
-        if (outClusterIdx < 0) return Point(-1, -1);
-
-        Point clusterCenter = clusters[outClusterIdx].center;
-        Point clusterMid = snakeHead.middlePoint(clusterCenter);
-        Point finalMid = clusterMid.middlePoint(mid);
-
-        // Closest battery to finalMid, skip if enemy grabs it
-        Point bestBat = clusterCenter;
-        int bestBatDist = 9999;
-        for (const auto& b : batteries) {
-            auto [enDist, enId] = findClosestEnemy(b, allSnakes);
-            int myDist = snakeHead.distanceTo(b);
-            if (enDist <= 1 && myDist > enDist) continue;
-            int d = b.distanceTo(finalMid);
-            if (d < bestBatDist) { bestBatDist = d; bestBat = b; }
+        // Too many → increase distance
+        while ((int)clusters.size() > MAX_CLUSTER_COUNT && dist < 50) {
+            dist++;
+            clusters = clusterBatteries(batteries, dist);
         }
-        return bestBat;
-    }
-
-    // Assign a slot: pick snake, enemy, cluster, target
-    void assignSlot(int slotIdx, int lockDuration, const vector<Point>& batteries,
-                    const vector<int>& mySnakeIds, const map<int, Snake>& allSnakes,
-                    set<int>& usedSnakes, set<int>& usedEnemies) {
-        auto& slot = slots[slotIdx];
-
-        // Check if locked snake is alive
-        if (slot.lockTurnsLeft > 0 && slot.snakeId >= 0) {
-            auto it = allSnakes.find(slot.snakeId);
-            if (it == allSnakes.end() || !it->second.isAlive())
-                slot.lockTurnsLeft = 0;
-        }
-
-        // Force recalculation if snake already taken by higher-priority slot
-        if (slot.lockTurnsLeft > 0 && usedSnakes.count(slot.snakeId)) {
-            slot.lockTurnsLeft = 0;
-        }
-
-        // Collect batteries from clusters not taken by other slots
-        set<int> usedClusters;
-        for (int s = 0; s < MAX_CHOSEN_SLOTS; s++) {
-            if (s == slotIdx) continue;
-            if (slots[s].clusterIdx >= 0 && slots[s].lockTurnsLeft > 0)
-                usedClusters.insert(slots[s].clusterIdx);
-        }
-        vector<Point> availBats;
-        for (int ci = 0; ci < (int)clusters.size(); ci++) {
-            if (usedClusters.count(ci)) continue;
-            for (const auto& b : clusters[ci].batteries) availBats.push_back(b);
-        }
-        if (availBats.empty()) { slot.active = false; return; }
-
-        // Recalculate if lock expired
-        if (slot.lockTurnsLeft <= 0) {
-            // mid = midpoint(CoM, enemy) — independent of snake
-            Point com = calcCoM(availBats);
-            Point enemyHead = findClosestEnemyHead(com, allSnakes, usedEnemies);
-            Point mid = com.middlePoint(enemyHead);
-
-            // Choose snake closest to mid (best interceptor)
-            int snakeId = findClosestSnake(mid, mySnakeIds, allSnakes, usedSnakes);
-            if (snakeId < 0) { slot.active = false; return; }
-
-            slot.snakeId = snakeId;
-            slot.lockTurnsLeft = lockDuration;
-        } else {
-            slot.lockTurnsLeft--;
-        }
-
-        if (slot.snakeId < 0) { slot.active = false; return; }
-        usedSnakes.insert(slot.snakeId);
-        if (availBats.empty()) { slot.active = false; return; }
-
-        Point snakeHead = allSnakes.at(slot.snakeId).getHead();
-        Point availCoM = calcCoM(availBats);
-        Point enemyHead = findClosestEnemyHead(availCoM, allSnakes, usedEnemies);
-
-        // Find enemy id for exclusion
-        for (const auto& [id, s] : allSnakes) {
-            if (!s.isMySnake() && s.isAlive() && s.getHead() == enemyHead) {
-                usedEnemies.insert(id);
-                slot.enemyId = id;
+        // Too many full clusters → decrease distance once
+        {
+            int fullCount = 0;
+            for (const auto& c : clusters)
+                if ((int)c.batteries.size() >= MAX_CLUSTER_SIZE) fullCount++;
+            if (fullCount > (int)clusters.size() / 2 && dist > 1) {
+                dist--;
+                clusters = clusterBatteries(batteries, dist);
             }
         }
-        slot.enemyHead = enemyHead;
-
-        Point mid = snakeHead.middlePoint(enemyHead);
-        int clusterIdx = -1;
-        slot.target = pickTarget(snakeHead, enemyHead, mid, clusters, availBats, allSnakes, usedClusters, clusterIdx);
-        slot.active = true;
-        slot.clusterIdx = clusterIdx;
-    }
-
-    void initClusters(const vector<Point>& batteries, int maxClusters) {
-        int clusterDist = CLUSTER_DISTANCE;
-        clusters = clusterBatteries(batteries, clusterDist);
-        while ((int)clusters.size() > maxClusters && clusterDist < 50) {
-            clusterDist++;
-            clusters = clusterBatteries(batteries, clusterDist);
-        }
+        cerr << "CLUSTER_TUNED dist=" << dist << " max=" << MAX_CLUSTER_COUNT << " got=" << clusters.size() << endl;
     }
 
     void removeEatenBatteries(const set<Point>& liveBats) {
@@ -1715,163 +1088,129 @@ class ClusterScorer : public IScorer {
             if (!c.batteries.empty()) c.recalcCenter();
         }
 
-        // Unlock slots whose cluster is empty
-        for (int i = 0; i < MAX_CHOSEN_SLOTS; i++) {
-            if (slots[i].clusterIdx >= 0 &&
-                slots[i].clusterIdx < (int)clusters.size() &&
-                clusters[slots[i].clusterIdx].batteries.empty()) {
-                slots[i].lockTurnsLeft = 0;
-            }
-        }
 
         // Remove empty clusters, update slot indices
         for (int i = (int)clusters.size() - 1; i >= 0; i--) {
             if (clusters[i].batteries.empty()) {
                 clusters.erase(clusters.begin() + i);
-                for (int s = 0; s < MAX_CHOSEN_SLOTS; s++) {
-                    if (slots[s].clusterIdx == i) slots[s].clusterIdx = -1;
-                    else if (slots[s].clusterIdx > i) slots[s].clusterIdx--;
-                }
             }
         }
     }
 
+    // Find reachable intermediate point between snake and target
+    DfsResult findPathWithMidpoints(const Snake& snake, const Point& target,
+                                     const LevelMap& levelMap, const map<int, Snake>& allSnakes) {
+        Point head = snake.getHead();
+        Point current = target;
+
+        // Narrow down to reachable distance
+        while (head.distanceTo(current) > MAX_AVAILABLE_DISTANCE) {
+            current = head.middlePoint(current);
+        }
+
+        // Try DFS, if fails — halve again
+        for (int attempts = 0; attempts < 5; attempts++) {
+            DfsResult path = dfsPathToTarget(snake, current, levelMap, allSnakes);
+            if (path.pathLen >= 0) {
+                return path;
+            }
+            if (head.distanceTo(current) <= 2) {
+                return path; // d=-1, unreachable
+            }
+            current = head.middlePoint(current);
+        }
+        return DfsResult();
+    }
+
     public:
+
+       // snakeId → target battery + DFS result
+        map<int, pair<Point, DfsResult>> snakeTargets;
+        Point lastCoM = Point(-1, -1);
+
         void update(const LevelMap& levelMap, const vector<int>& mySnakeIds,
                     const map<int, Snake>& allSnakes) {
-            for (int i = 0; i < MAX_CHOSEN_SLOTS; i++) slots[i].active = false;
-            lastLog = "";
-            turnCount++;
+            snakeTargets.clear();
             auto batteries = levelMap.getPowerElements();
             if (batteries.empty()) return;
 
-            if (clusters.empty()) {
-                initClusters(batteries, (int)mySnakeIds.size() + 1);
-                cerr << "Clusters: " << clusters.size() << endl;
+            // Init clusters once, then only remove eaten batteries
+            if (!clustersInitialized) {
+                initClusters(batteries);
+                clustersInitialized = true;
+                cerr << "CL: (" << clusters.size() << "):" << endl;
                 for (int i = 0; i < (int)clusters.size(); i++) {
-                    cerr << "C" << i << ": " << clusters[i].batteries.size()
-                         << " bats, center=" << clusters[i].center << " | ";
-                    for (const auto& b : clusters[i].batteries) cerr << b << " ";
+                    cerr << "  C" << i << " center=" << clusters[i].center
+                         << " bats=" << clusters[i].batteries.size() << ":";
+                    for (const auto& b : clusters[i].batteries) cerr << " " << b;
                     cerr << endl;
                 }
             } else {
                 set<Point> liveBats(batteries.begin(), batteries.end());
                 removeEatenBatteries(liveBats);
             }
+            if (clusters.empty()) return;
 
-            if (turnCount < CHOSEN_START_TURN) return;
+            Point com = calcCoM(batteries);
+            lastCoM = com;
 
-            set<int> usedSnakes, usedEnemies;
+            for (int id : mySnakeIds) {
+                auto it = allSnakes.find(id);
+                if (it == allSnakes.end() || !it->second.isAlive()) continue;
 
-            // Assign slots: #0 = full lock, rest = half lock
-            int numSlots = min((int)mySnakeIds.size(), min((int)clusters.size(), MAX_CHOSEN_SLOTS));
-            for (int i = 0; i < numSlots; i++) {
-                int lockDur = (i == 0) ? CHOSEN_LOCK_TURNS : CHOSEN_LOCK_TURNS / 2;
-                assignSlot(i, lockDur, batteries, mySnakeIds, allSnakes,
-                           usedSnakes, usedEnemies);
-            }
+                Point head = it->second.getHead();
+                Point mid = head.middlePoint(com);
 
-            // Marks for primary only, log for all
-            ostringstream oss;
-            for (int i = 0; i < numSlots; i++) {
-                if (!slots[i].active) continue;
-                int enBfsDist = -1;
-                // Enemy BFS dist to target
-                if (enemyBfsDist) {
-                    auto eit = enemyBfsDist->find(slots[i].target);
-                    if (eit != enemyBfsDist->end()) enBfsDist = eit->second;
+                // Closest cluster to mid
+                int bestCluster = -1;
+                int bestDist = 9999;
+                for (int i = 0; i < (int)clusters.size(); i++) {
+                    int d = clusters[i].center.distanceTo(mid);
+                    if (d < bestDist) { bestDist = d; bestCluster = i; }
                 }
-                oss << endl << "[#" << i << " S" << slots[i].snakeId << "(lock=" << slots[i].lockTurnsLeft
-                    << ") → " << slots[i].target << " enBfs=" << enBfsDist
-                    << " vs S" << slots[i].enemyId << "=" << slots[i].enemyHead << "]";
+                if (bestCluster < 0) continue;
+
+                // Closest battery in cluster to snake
+                Point bestBat(-1, -1);
+                int bestBatDist = 9999;
+                for (const auto& b : clusters[bestCluster].batteries) {
+                    int d = head.distanceTo(b);
+                    if (d < bestBatDist) { bestBatDist = d; bestBat = b; }
+                }
+                if (bestBat == Point(-1, -1)) continue;
+
+                // DFS to target (with midpoints if far)
+                DfsResult path = findPathWithMidpoints(it->second, bestBat, levelMap, allSnakes);
+                snakeTargets[id] = {bestBat, path};
+                cerr << "CLUSTER S" << id << " -> " << bestBat << " (cluster " << bestCluster
+                     << ", d=" << path.pathLen << ")" << endl;
             }
-            lastLog = oss.str();
         }
 
-        void setEnemyBfs(const map<Point, int>* bfs) { enemyBfsDist = bfs; }
-        string getLog() const { return lastLog; }
-        const vector<BatteryCluster>& getClusters() const { return clusters; }
-
-        void outputMarks(const map<int, Snake>& allSnakes) {
-            if (!slots[0].active) return;
-            if (allSnakes.find(slots[0].snakeId) == allSnakes.end()) return;
-            markPoint(slots[0].target);
-            markPoint(allSnakes.at(slots[0].snakeId).getHead());
-            markPoint(slots[0].enemyHead);
-            markPoint(allSnakes.at(slots[0].snakeId).getHead().middlePoint(slots[0].enemyHead));
-        }
-
-        set<int> getChosenIds() const {
-            set<int> ids;
-            for (int i = 0; i < MAX_CHOSEN_SLOTS; i++) if (slots[i].active) ids.insert(slots[i].snakeId);
-            return ids;
-        }
-
-        Point getTarget(int snakeId) const {
-            for (int i = 0; i < MAX_CHOSEN_SLOTS; i++) {
-                if (slots[i].active && slots[i].snakeId == snakeId) return slots[i].target;
-            }
-            return Point(-1, -1);
-        }
 
         int evaluate(const Snake& snake, const LevelMap& levelMap,
                     const map<int, Snake>& allSnakes, int direction) override {
-            // Check all slots
-            for (int s = 0; s < MAX_CHOSEN_SLOTS; s++) {
-                if (!slots[s].active || snake.getId() != slots[s].snakeId) continue;
-
-                Point newHead = getCustomPoint(snake.getHead(), direction);
-                int oldDist = snake.getHead().distanceTo(slots[s].target);
-                int newDist = newHead.distanceTo(slots[s].target);
-
-                int score = 0;
-                if (newDist < oldDist) {
-                    score = CHOSEN_BONUS / (newDist + 1);
-                } else if (newDist > oldDist) {
-                    score = -(CHOSEN_BONUS / (oldDist + 1));
-                } else {
-                    // Manhattan equal — Euclidean breaks tie
-                    int dx1 = newHead.x - slots[s].target.x, dy1 = newHead.y - slots[s].target.y;
-                    int dx0 = snake.getHead().x - slots[s].target.x, dy0 = snake.getHead().y - slots[s].target.y;
-                    score = (dx0*dx0 + dy0*dy0) - (dx1*dx1 + dy1*dy1);
-                }
-
-                //cerr << "Chosen: " << score << ", ";
-                return score;
-            }
+            auto it = snakeTargets.find(snake.getId());
+            if (it == snakeTargets.end()) return 0;
+            const auto& [target, path] = it->second;
+            if (path.pathLen < 0) return 0;
+            if (path.firstDir == direction) return BASE_BONUS;
             return 0;
         }
+
 };
 
-struct SnakeDecision {
-    int snakeId;
-    Direction dir;
-    Point targetCell;
-    Point head;
-    int scores[4];
-    bool needsRecalc = false;
-    SnakeDecision(int id, Direction d, Point h, const int* sc)
-        : snakeId(id), dir(d), targetCell(h + directories[d]), head(h) {
-        for (int i = 0; i < 4; i++) scores[i] = sc[i];
-    }
-};
 
 class DecisionMaker {
     vector<shared_ptr<IScorer>> scorers;
-    shared_ptr<AntiLoopScorer> antiLoop;
-    shared_ptr<ExplorationScorer> exploration;
     shared_ptr<BatteryScorer> batteryScorer;
-    shared_ptr<HuntScorer> huntScorer;
     shared_ptr<ClusterScorer> clusterScorer;
-    shared_ptr<BodyBlockScorer> bodyBlockScorer;
-    int lastScores[4] = {};
-    set<Point> blockedCells;
     map<int, vector<DfsResult>> snakeDfsPaths; // snakeId → reachable batteries via DFS
+    int currentDfsDepth = MAX_DFS_DEPTH;
+    int turnCounter = 0;
 
     public:
-        const int* getLastScores() const { return lastScores; }
-        void setBlockedCells(const set<Point>& cells) { blockedCells = cells; }
-        void clearBlockedCells() { blockedCells.clear(); }
+        void onSnakeDied() { currentDfsDepth += DEPTH_INCREASING; cerr << "DFS depth -> " << currentDfsDepth << endl; }
 
         DecisionMaker() {
             srand(time(nullptr));
@@ -1879,32 +1218,21 @@ class DecisionMaker {
             scorers.push_back(make_shared<SafetyScorer>());
             batteryScorer = make_shared<BatteryScorer>();
             scorers.push_back(batteryScorer);
-            huntScorer = make_shared<HuntScorer>();
-            scorers.push_back(huntScorer);
-
-            exploration = make_shared<ExplorationScorer>();
-            scorers.push_back(exploration);
-
-            antiLoop = make_shared<AntiLoopScorer>();
-            scorers.push_back(antiLoop);
 
             clusterScorer = make_shared<ClusterScorer>();
             scorers.push_back(clusterScorer);
 
-            bodyBlockScorer = make_shared<BodyBlockScorer>();
-            scorers.push_back(bodyBlockScorer);
 
 
         }
         
 
-        Direction decide(const Snake& snake, const LevelMap& levelMap, 
+        Direction decide(const Snake& snake, const LevelMap& levelMap,
                         const map<int, Snake>& allSnakes) {
             int bestScore = -1000000;
 
 
             Direction bestDir = snake.getMovingDirection();  // default: keep going
-            antiLoop->recordPosition(snake.getId(), snake.getHead(), snake.getMovingDirection());
             // Feed DFS results to BatteryScorer
             const auto& dfsPaths = getDfsPaths(snake.getId());
             batteryScorer->setCache(snake.getId(), dfsPaths);
@@ -1912,64 +1240,30 @@ class DecisionMaker {
             // Try all 4 directions
             for (int dir = 0; dir < 4; dir++) {
                 int totalScore = 0;
-                cerr << snake.getHead() + directories[dir] << " ";
-                
-                // Check if direction is blocked by conflict resolution
-                Point dirTarget = snake.getHead() + directories[dir];
-                if (blockedCells.count(dirTarget)) {
-                    decisions[dir] = DEATH_FINE;
-                    //cerr << "[BLOCKED] total: " << DEATH_FINE << endl;
-                    continue;
-                }
 
                 int safetyTotalScore    = scorers[0]->evaluate(snake, levelMap, allSnakes, dir);
                 int batteryTotalScore   = scorers[1]->evaluate(snake, levelMap, allSnakes, dir);
-                int huntTotalScore      = scorers[2]->evaluate(snake, levelMap, allSnakes, dir);
-                int exploreTotalScore   = scorers[3]->evaluate(snake, levelMap, allSnakes, dir);
-                int antiloopTotalScore  = scorers[4]->evaluate(snake, levelMap, allSnakes, dir);
-                int chosenTotalScore    = scorers[5]->evaluate(snake, levelMap, allSnakes, dir);
-                int blockTotalScore     = scorers[6]->evaluate(snake, levelMap, allSnakes, dir);
+                int clusterTotalScore   = scorers[2]->evaluate(snake, levelMap, allSnakes, dir);
 
-                totalScore = safetyTotalScore + antiloopTotalScore + huntTotalScore + blockTotalScore;
-                {
-                    // Gradual weight reduction for exploration/battery with heat
-                    int heat = snake.getHeat();
-                    int divisor = max(1, heat);  // heat 0→/1, 1→/1, 2→/2, 3→/3...
-                    totalScore += exploreTotalScore / divisor;
-                    totalScore += batteryTotalScore / divisor;
-                }
-                totalScore += chosenTotalScore;
+                // Prefer battery if short path exists, otherwise cluster
+                int pathScore = (batteryTotalScore > 0) ? batteryTotalScore : clusterTotalScore;
+                totalScore = safetyTotalScore + pathScore;
                
-                cerr << "total: " << totalScore << endl;
                 decisions[dir] = totalScore;
             }
 
             // Save scores for conflict resolution
-            for (int i = 0; i < 4; i++) lastScores[i] = decisions[i];
 
             // Tiebreaker: equal scores — Euclidean to cluster target, or Manhattan to nearest battery
             Point head = snake.getHead();
-            Point clusterTarget = clusterScorer->getTarget(snake.getId());
-            bool hasClusterTarget = !(clusterTarget == Point(-1, -1));
-
-            Point targetBat = clusterTarget;
-            if (!hasClusterTarget) {
-                vector<Point> bats = levelMap.getPowerElements();
-                int closestBatId = head.getClosestBattery(bats);
-                targetBat = bats.empty() ? head : bats[closestBatId];
-            }
+            vector<Point> bats = levelMap.getPowerElements();
+            int closestBatId = head.getClosestBattery(bats);
+            Point targetBat = bats.empty() ? head : bats[closestBatId];
 
             int bestTiebreak = 999999;
             for (int dir = 0; dir < 4; dir++) {
                 Point newHead = head + directories[dir];
-                int tiebreak;
-                if (hasClusterTarget) {
-                    // Euclidean squared to cluster target (lower = better)
-                    int dx = newHead.x - targetBat.x, dy = newHead.y - targetBat.y;
-                    tiebreak = dx*dx + dy*dy;
-                } else {
-                    tiebreak = newHead.distanceTo(targetBat);
-                }
+                int tiebreak = newHead.distanceTo(targetBat);
 
                 if (decisions[dir] > bestScore) {
                     bestScore = decisions[dir];
@@ -1984,67 +1278,81 @@ class DecisionMaker {
             }
             
 
-            antiLoop->recordDirection(snake.getId(), bestDir, snake.getHead());
-
             // Claim battery so other snakes don't chase the same one
             Point claimed = batteryScorer->getBestBatteryForDir(snake, allSnakes, bestDir);
             if (!(claimed == Point(-1, -1))) {
                 batteryScorer->claimBattery(claimed);
-                //cerr << "Target battery: " << claimed << " " << endl;
+                cerr << "S" << snake.getId() << " -> bat " << claimed << endl;
+            } else {
+                cerr << "S" << snake.getId() << " -> no target" << endl;
             }
 
-            //cerr << getDirectionName(bestDir)[0] << endl  << endl;
 
             return bestDir;
         }
 
-        void resolveConflicts(vector<SnakeDecision>& decisions, const LevelMap& levelMap,
-                              map<int, Snake>& allSnakes) {
-            for (int i = 0; i < (int)decisions.size(); i++) {
-                for (int j = i + 1; j < (int)decisions.size(); j++) {
-                    if (!(decisions[i].targetCell == decisions[j].targetCell)) continue;
-                    cerr << "[CONFLICT S" << decisions[i].snakeId << " & S" << decisions[j].snakeId
-                         << " at " << decisions[i].targetCell << "]" << endl;
-                    bool resolved = false;
-                    for (int victim : {i, j}) {
-                        if (resolved) break;
-                        auto& dec = decisions[victim];
-                        auto it = allSnakes.find(dec.snakeId);
-                        if (it == allSnakes.end()) continue;
-                        setBlockedCells({dec.targetCell});
-                        Direction newDir = decide(it->second, levelMap, allSnakes);
-                        clearBlockedCells();
-                        if (getLastScores()[newDir] > DEATH_FINE) {
-                            dec.dir = newDir;
-                            dec.targetCell = dec.head + directories[newDir];
-                            const int* sc = getLastScores();
-                            for (int k = 0; k < 4; k++) dec.scores[k] = sc[k];
-                            cerr << "[REROUTED S" << dec.snakeId << " → " << dec.targetCell << "]" << endl;
-                            resolved = true;
-                        }
-                    }
-                    if (!resolved) cerr << "[CONFLICT UNRESOLVED]" << endl;
-                }
-            }
-        }
 
-        void update(LevelMap& levelMap, const vector<int>& mySnakeIds, map<int, Snake>& allSnakes) {
-            exploration->InitZones(levelMap, mySnakeIds, allSnakes);
-            batteryScorer->clearCache();
-            huntScorer->updateEnemyBfs(levelMap, allSnakes);
-            batteryScorer->setEnemyBfs(&huntScorer->enemyBfsDist);
-            clusterScorer->setEnemyBfs(&huntScorer->enemyBfsDist);
-            clusterScorer->update(levelMap, mySnakeIds, allSnakes);
-            exploration->setClusters(&clusterScorer->getClusters());
 
-            // Compute DFS paths for all my snakes
+        void computeDfsPaths(const LevelMap& map, const vector<int>& mySnakeIds,
+                             const std::map<int, Snake>& allSnakes) {
             snakeDfsPaths.clear();
             for (int id : mySnakeIds) {
                 auto it = allSnakes.find(id);
                 if (it == allSnakes.end() || !it->second.isAlive()) continue;
-                snakeDfsPaths[id] = findBatteriesDfs(it->second, levelMap, allSnakes);
-                cerr << "DFS S" << id << ": " << snakeDfsPaths[id].size() << " bats" << endl;
+                snakeDfsPaths[id] = findBatteriesDfs(it->second, map, allSnakes, currentDfsDepth);
             }
+        }
+
+        bool allDfsEmpty() const {
+            for (const auto& [id, paths] : snakeDfsPaths) {
+                if (!paths.empty()) return false;
+            }
+            return true;
+        }
+
+        void logDfsPaths() const {
+            for (const auto& [id, paths] : snakeDfsPaths) {
+                cerr << "DFS S" << id << ": " << paths.size() << " bats";
+                for (const auto& r : paths) {
+                    cerr << " [" << r.target << " d=" << r.pathLen << "]";
+                }
+                cerr << endl;
+            }
+        }
+
+        void update(LevelMap& levelMap, const vector<int>& mySnakeIds, map<int, Snake>& allSnakes) {
+            batteryScorer->clearCache();
+            clusterScorer->update(levelMap, mySnakeIds, allSnakes);
+            turnCounter++;
+
+            // Compute DFS on real map
+            computeDfsPaths(levelMap, mySnakeIds, allSnakes);
+
+            // Step 6: Pre-assign batteries — closest snake (by DFS path) gets each battery
+            {
+                struct Claim { int snakeId; Point battery; int pathLen; };
+                vector<Claim> claims;
+                for (const auto& [id, paths] : snakeDfsPaths) {
+                    for (const auto& r : paths) {
+                        claims.push_back({id, r.target, r.pathLen});
+                    }
+                }
+                sort(claims.begin(), claims.end(), [](const Claim& a, const Claim& b) {
+                    return a.pathLen < b.pathLen;
+                });
+                set<Point> taken;
+                set<int> assigned;
+                for (const auto& c : claims) {
+                    if (taken.count(c.battery)) continue;
+                    if (assigned.count(c.snakeId)) continue;
+                    taken.insert(c.battery);
+                    assigned.insert(c.snakeId);
+                    batteryScorer->assignBattery(c.battery, c.snakeId);
+                    cerr << "ASSIGN S" << c.snakeId << " -> " << c.battery << " (d=" << c.pathLen << ")" << endl;
+                }
+            }
+
+            logDfsPaths();
         }
 
         const vector<DfsResult>& getDfsPaths(int snakeId) const {
@@ -2053,8 +1361,12 @@ class DecisionMaker {
             return it != snakeDfsPaths.end() ? it->second : empty;
         }
 
-        string getChosenLog() const { return clusterScorer->getLog(); }
-        void outputMarks(const map<int, Snake>& allSnakes) { clusterScorer->outputMarks(allSnakes); }
+        void outputMarks(const map<int, Snake>& allSnakes) {
+            markPoint(clusterScorer->lastCoM);
+            for (const auto& [id, tp] : clusterScorer->snakeTargets) {
+                markPoint(tp.first);
+            }
+        }
 };
 
 
@@ -2086,8 +1398,12 @@ class GameState {
             }
         }
         
+        bool mySnakeDied = false;
+        bool didMySnakeDie() { bool r = mySnakeDied; mySnakeDied = false; return r; }
+
         // Update snake state each turn
         void updateSnakes(int snakebotCount) {
+            mySnakeDied = false;
             // Temp set of alive IDs this turn
             set<int> aliveIds;
             
@@ -2110,6 +1426,7 @@ class GameState {
                 if (aliveIds.find(it->first) == aliveIds.end()) {
                     // Dead — remove
                     if (it->second.isMySnake()) {
+                        mySnakeDied = true;
                         // Remove from mySnakeIds
                         mySnakeIds.erase(
                             remove(mySnakeIds.begin(), mySnakeIds.end(), it->first),
@@ -2138,6 +1455,7 @@ class GameState {
             }
             return result;
         }
+
 };
 
 
@@ -2146,9 +1464,8 @@ int main() {
     cin >> my_id; cin.ignore();
     int width, height;
     cin >> width >> height; cin.ignore();
-    
+    MAX_CLUSTER_COUNT = pow(width*height, 1.0/3.0)+1;
     GameState state(width, height);
-    
     // Read initial map
     vector<string> rowMap;
     for (int i = 0; i < height; i++) {
@@ -2182,7 +1499,8 @@ int main() {
         
         // Update all snakes
         state.updateSnakes(snakebot_count);
-        
+        if (state.didMySnakeDie()) decisionMaker.onSnakeDied();
+
         // Make decisions for my snakes
         string output;
 
@@ -2198,27 +1516,14 @@ int main() {
 
         decisionMaker.update(state.levelMap, state.mySnakeIds, state.allSnakes);
 
-        // Phase 1: collect all decisions
-        vector<SnakeDecision> decisions;
         for (auto& snakeRef : state.getMySnakes()) {
             Snake& snake = snakeRef.get();
             snake.debug();
             Direction dir = decisionMaker.decide(snake, state.levelMap, state.allSnakes);
-            decisions.emplace_back(snake.getId(), dir, snake.getHead(), decisionMaker.getLastScores());
-        }
+            snake.setMovingDirection(dir);
+            output += to_string(snake.getId()) + " " + getDirectionName(dir) + ";";
 
-        // Phase 2: resolve conflicts
-        decisionMaker.resolveConflicts(decisions, state.levelMap, state.allSnakes);
-
-        // Phase 3: apply decisions and output
-        for (auto& dec : decisions) {
-            auto it = state.allSnakes.find(dec.snakeId);
-            if (it == state.allSnakes.end()) continue;
-            Snake& snake = it->second;
-            snake.setMovingDirection(dec.dir);
-            output += to_string(dec.snakeId) + " " + getDirectionName(dec.dir) + ";";
-
-            Point newHead = snake.getHead() + directories[dec.dir];
+            Point newHead = snake.getHead() + directories[dir];
             bool eatsBattery = state.levelMap.isBattery(newHead);
             snake.updateHead(newHead, eatsBattery);
             if (eatsBattery) {
@@ -2228,7 +1533,6 @@ int main() {
 
         decisionMaker.outputMarks(state.allSnakes);
         if (output.empty()) output = "WAIT";
-        //cerr << decisionMaker.getChosenLog() << endl;
         cout << output << endl;
     }
 }
